@@ -15,6 +15,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	_ "net/http/pprof"
 	"strings"
 
 	"golang.zx2c4.com/wireguard/conn"
@@ -79,8 +80,14 @@ func stopWg() {
 	}
 }
 
+// startWg param:
+//
+//	protocol:
+//	  0 for udp (default)
+//	  1 for tcp (default)
+//
 //export startWg
-func startWg(logLevel C.int, interfaceName *C.cchar_t) C.int {
+func startWg(logLevel, protocol C.int, interfaceName *C.cchar_t) C.int {
 	name := C.GoString(interfaceName)
 	logger = device.NewLogger(
 		int(logLevel),
@@ -102,7 +109,19 @@ func startWg(logLevel C.int, interfaceName *C.cchar_t) C.int {
 		return ExitSetupFailed
 	}
 
-	wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
+	switch protocol {
+	case 0:
+		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
+	case 1:
+		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
+	default:
+		logger.Errorf("Protocol %d not supported", protocol)
+		return ExitSetupFailed
+	}
+
+	//go func() {
+	//	_ = http.ListenAndServe("localhost:6060", nil)
+	//}()
 
 	logger.Verbosef("Device %s started", name)
 	ret := upDeviceForWindows(wgDevice)

@@ -1,4 +1,4 @@
-package corplink
+package common
 
 import "sync"
 

@@ -2,9 +2,11 @@ package corplink
 
 import (
 	"github.com/vishvananda/netlink"
+
+	"golang.zx2c4.com/wireguard/common"
 )
 
-var linkMap SyncMap[string, netlink.Link]
+var linkMap common.SyncMap[string, netlink.Link]
 
 func loadLink(name string) (netlink.Link, error) {
 	var err error

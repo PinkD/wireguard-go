@@ -8,6 +8,7 @@
 package conn
 
 import (
+	"net"
 	"runtime"
 
 	"golang.org/x/sys/unix"
@@ -62,4 +63,27 @@ func (s *StdNetBind) SetMark(mark uint32) error {
 		}
 	}
 	return nil
+}
+
+func (t *TcpBind) SetMark(mark uint32) error {
+	if fwmarkIoctl == 0 {
+		return nil
+	}
+	var err error
+	t.tcpConnMap.Range(func(_ string, v *net.TCPConn) bool {
+		fd, e := v.SyscallConn()
+		if e != nil {
+			err = e
+			return false
+		}
+		e = fd.Control(func(fd uintptr) {
+			err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, fwmarkIoctl, int(mark))
+		})
+		if e == nil {
+			err = e
+			return false
+		}
+		return true
+	})
+	return err
 }
