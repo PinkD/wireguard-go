@@ -67,24 +67,18 @@ func (t *TcpBind) makeReceive() ReceiveFunc {
 		}
 
 		count := 0
-		for {
-			select {
-			case <-t.closeChan:
-				return 0, net.ErrClosed
-			case data := <-t.recvChan:
-				if data == nil {
-					continue
-				}
-				sizes[count] = data.size
-				copy(bufs[count], data.buff[:sizes[count]])
-				eps[count] = data.endpoint
-				count++
-				if count == len(bufs) {
-					return count, nil
-				}
-			default:
-				return count, nil
+		select {
+		case <-t.closeChan:
+			return 0, net.ErrClosed
+		case data := <-t.recvChan:
+			if data == nil {
+				return 0, nil
 			}
+			sizes[count] = data.size
+			copy(bufs[count], data.buff[:sizes[count]])
+			eps[count] = data.endpoint
+			count++
+			return count, nil
 		}
 	}
 }

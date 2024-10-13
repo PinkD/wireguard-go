@@ -15,7 +15,8 @@ import "C"
 import (
 	"errors"
 	"fmt"
-	_ "net/http/pprof"
+	// "net/http"
+	// _ "net/http/pprof"
 	"strings"
 
 	"golang.zx2c4.com/wireguard/conn"
