@@ -2,7 +2,7 @@
 
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
  */
 
 package conn
@@ -105,6 +105,8 @@ func setSrcControl(control *[]byte, ep *StdNetEndpoint) {
 	*control = append(*control, ep.src...)
 }
 
-var srcControlSize = unix.CmsgSpace(unix.SizeofInet6Pktinfo)
+// stickyControlSize returns the recommended buffer size for pooling sticky
+// offloading control data.
+var stickyControlSize = unix.CmsgSpace(unix.SizeofInet6Pktinfo)
 
 const StdNetSupportsStickySockets = true

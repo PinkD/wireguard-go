@@ -1,26 +1,86 @@
 package tun
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math/bits"
+)
 
 // TODO: Explore SIMD and/or other assembly optimizations.
 func checksumNoFold(b []byte, initial uint64) uint64 {
-	ac := initial
-	i := 0
-	n := len(b)
-	for n >= 4 {
-		ac += uint64(binary.BigEndian.Uint32(b[i : i+4]))
-		n -= 4
-		i += 4
+	tmp := make([]byte, 8)
+	binary.NativeEndian.PutUint64(tmp, initial)
+	ac := binary.BigEndian.Uint64(tmp)
+	var carry uint64
+
+	for len(b) >= 128 {
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[:8]), 0)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[8:16]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[16:24]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[24:32]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[32:40]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[40:48]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[48:56]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[56:64]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[64:72]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[72:80]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[80:88]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[88:96]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[96:104]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[104:112]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[112:120]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[120:128]), carry)
+		ac += carry
+		b = b[128:]
 	}
-	for n >= 2 {
-		ac += uint64(binary.BigEndian.Uint16(b[i : i+2]))
-		n -= 2
-		i += 2
+	if len(b) >= 64 {
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[:8]), 0)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[8:16]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[16:24]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[24:32]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[32:40]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[40:48]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[48:56]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[56:64]), carry)
+		ac += carry
+		b = b[64:]
 	}
-	if n == 1 {
-		ac += uint64(b[i]) << 8
+	if len(b) >= 32 {
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[:8]), 0)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[8:16]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[16:24]), carry)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[24:32]), carry)
+		ac += carry
+		b = b[32:]
 	}
-	return ac
+	if len(b) >= 16 {
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[:8]), 0)
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[8:16]), carry)
+		ac += carry
+		b = b[16:]
+	}
+	if len(b) >= 8 {
+		ac, carry = bits.Add64(ac, binary.NativeEndian.Uint64(b[:8]), 0)
+		ac += carry
+		b = b[8:]
+	}
+	if len(b) >= 4 {
+		ac, carry = bits.Add64(ac, uint64(binary.NativeEndian.Uint32(b[:4])), 0)
+		ac += carry
+		b = b[4:]
+	}
+	if len(b) >= 2 {
+		ac, carry = bits.Add64(ac, uint64(binary.NativeEndian.Uint16(b[:2])), 0)
+		ac += carry
+		b = b[2:]
+	}
+	if len(b) == 1 {
+		tmp := binary.NativeEndian.Uint16([]byte{b[0], 0})
+		ac, carry = bits.Add64(ac, uint64(tmp), 0)
+		ac += carry
+	}
+
+	binary.NativeEndian.PutUint64(tmp, ac)
+	return binary.BigEndian.Uint64(tmp)
 }
 
 func checksum(b []byte, initial uint64) uint16 {

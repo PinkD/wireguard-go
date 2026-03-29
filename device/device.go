@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
  */
 
 package device
@@ -68,11 +68,11 @@ type Device struct {
 	cookieChecker CookieChecker
 
 	pool struct {
-		outboundElementsSlice *WaitPool
-		inboundElementsSlice  *WaitPool
-		messageBuffers        *WaitPool
-		inboundElements       *WaitPool
-		outboundElements      *WaitPool
+		inboundElementsContainer  *WaitPool
+		outboundElementsContainer *WaitPool
+		messageBuffers            *WaitPool
+		inboundElements           *WaitPool
+		outboundElements          *WaitPool
 	}
 
 	queue struct {
@@ -368,10 +368,10 @@ func (device *Device) RemoveAllPeers() {
 }
 
 func (device *Device) Close() {
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
 	device.state.Lock()
 	defer device.state.Unlock()
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
 	if device.isClosed() {
 		return
 	}
@@ -461,11 +461,7 @@ func (device *Device) BindSetMark(mark uint32) error {
 	// clear cached source addresses
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
-		peer.Lock()
-		defer peer.Unlock()
-		if peer.endpoint != nil {
-			peer.endpoint.ClearSrc()
-		}
+		peer.markEndpointSrcForClearing()
 	}
 	device.peers.RUnlock()
 
@@ -515,11 +511,7 @@ func (device *Device) BindUpdate() error {
 	// clear cached source addresses
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
-		peer.Lock()
-		defer peer.Unlock()
-		if peer.endpoint != nil {
-			peer.endpoint.ClearSrc()
-		}
+		peer.markEndpointSrcForClearing()
 	}
 	device.peers.RUnlock()
 

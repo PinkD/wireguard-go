@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
  */
 
 package netstack
@@ -25,7 +25,7 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 
 	"golang.org/x/net/dns/dnsmessage"
-	"gvisor.dev/gvisor/pkg/bufferv2"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -43,7 +43,8 @@ type netTun struct {
 	ep             *channel.Endpoint
 	stack          *stack.Stack
 	events         chan tun.Event
-	incomingPacket chan *bufferv2.View
+	notifyHandle   *channel.NotificationHandle
+	incomingPacket chan *buffer.View
 	mtu            int
 	dnsServers     []netip.Addr
 	hasV4, hasV6   bool
@@ -61,7 +62,7 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device,
 		ep:             channel.New(1024, uint32(mtu), ""),
 		stack:          stack.New(opts),
 		events:         make(chan tun.Event, 10),
-		incomingPacket: make(chan *bufferv2.View),
+		incomingPacket: make(chan *buffer.View),
 		dnsServers:     dnsServers,
 		mtu:            mtu,
 	}
@@ -70,7 +71,7 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device,
 	if tcpipErr != nil {
 		return nil, nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
 	}
-	dev.ep.AddNotify(dev)
+	dev.notifyHandle = dev.ep.AddNotify(dev)
 	tcpipErr = dev.stack.CreateNIC(1, dev.ep)
 	if tcpipErr != nil {
 		return nil, nil, fmt.Errorf("CreateNIC: %v", tcpipErr)
@@ -84,7 +85,7 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device,
 		}
 		protoAddr := tcpip.ProtocolAddress{
 			Protocol:          protoNumber,
-			AddressWithPrefix: tcpip.Address(ip.AsSlice()).WithPrefix(),
+			AddressWithPrefix: tcpip.AddrFromSlice(ip.AsSlice()).WithPrefix(),
 		}
 		tcpipErr := dev.stack.AddProtocolAddress(1, protoAddr, stack.AddressProperties{})
 		if tcpipErr != nil {
@@ -140,7 +141,7 @@ func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
 			continue
 		}
 
-		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: bufferv2.MakeWithData(packet)})
+		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(packet)})
 		switch packet[0] >> 4 {
 		case 4:
 			tun.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
@@ -155,7 +156,7 @@ func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
 
 func (tun *netTun) WriteNotify() {
 	pkt := tun.ep.Read()
-	if pkt.IsNil() {
+	if pkt == nil {
 		return
 	}
 
@@ -167,12 +168,13 @@ func (tun *netTun) WriteNotify() {
 
 func (tun *netTun) Close() error {
 	tun.stack.RemoveNIC(1)
+	tun.stack.Close()
+	tun.ep.RemoveNotify(tun.notifyHandle)
+	tun.ep.Close()
 
 	if tun.events != nil {
 		close(tun.events)
 	}
-
-	tun.ep.Close()
 
 	if tun.incomingPacket != nil {
 		close(tun.incomingPacket)
@@ -198,7 +200,7 @@ func convertToFullAddr(endpoint netip.AddrPort) (tcpip.FullAddress, tcpip.Networ
 	}
 	return tcpip.FullAddress{
 		NIC:  1,
-		Addr: tcpip.Address(endpoint.Addr().AsSlice()),
+		Addr: tcpip.AddrFromSlice(endpoint.Addr().AsSlice()),
 		Port: endpoint.Port(),
 	}, protoNumber
 }
@@ -453,7 +455,7 @@ func (pc *PingConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		return 0, nil, fmt.Errorf("ping read: %s", tcpipErr)
 	}
 
-	remoteAddr, _ := netip.AddrFromSlice([]byte(res.RemoteAddr.Addr))
+	remoteAddr, _ := netip.AddrFromSlice(res.RemoteAddr.Addr.AsSlice())
 	return res.Count, &PingAddr{remoteAddr}, nil
 }
 
