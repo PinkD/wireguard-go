@@ -1,10 +1,12 @@
-//go:build !race
+//go:build !linux
 
 /* SPDX-License-Identifier: MIT
  *
  * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
  */
 
-package device
+package conn
 
-const raceEnabled = false
+func errShouldDisableUDPGSO(_ error) bool {
+	return false
+}
