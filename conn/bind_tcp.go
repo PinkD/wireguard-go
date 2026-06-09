@@ -200,11 +200,8 @@ func (t *TcpBind) Send(bufs [][]byte, endpoint Endpoint) error {
 	for _, buf := range bufs {
 		var l reqLen
 		l.FromLen(len(buf))
-		_, err := conn.Write(l[:])
-		if err != nil {
-			return err
-		}
-		_, err = conn.Write(buf)
+		b := net.Buffers{l[:], buf}
+		_, err := b.WriteTo(conn)
 		if err != nil {
 			return err
 		}
