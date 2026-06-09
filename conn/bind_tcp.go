@@ -77,6 +77,7 @@ func (t *TcpBind) makeReceive() ReceiveFunc {
 			sizes[count] = data.size
 			copy(bufs[count], data.buff[:sizes[count]])
 			eps[count] = data.endpoint
+			t.dataPool.Put(data)
 			count++
 			return count, nil
 		}
@@ -85,29 +86,32 @@ func (t *TcpBind) makeReceive() ReceiveFunc {
 
 func (t *TcpBind) handleConn(conn *net.TCPConn, endpoint Endpoint) {
 	go func() {
-		data := t.dataPool.Get().(*recvData)
-		defer t.dataPool.Put(data)
 		defer conn.Close()
 		for {
+			data := t.dataPool.Get().(*recvData)
 			// read uint32 size header
 			_, err := io.ReadFull(conn, data.len[:])
 			if err != nil {
+				t.dataPool.Put(data)
 				return
 			}
 			l := reqLen(data.len)
 			size := l.Len()
-			// read real data
-			n, err := io.ReadFull(conn, data.buff[:size])
-			if err != nil {
+			if size < 0 || size > MaxSegmentSize {
+				t.dataPool.Put(data)
 				return
 			}
-			if n != size {
-				continue
+			// read real data
+			_, err = io.ReadFull(conn, data.buff[:size])
+			if err != nil {
+				t.dataPool.Put(data)
+				return
 			}
 			data.size = size
 			data.endpoint = endpoint
 			select {
 			case <-t.closeChan:
+				t.dataPool.Put(data)
 				return
 			default:
 			}
