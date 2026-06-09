@@ -92,9 +92,12 @@ func stopWg() {
 //	protocol:
 //	  0 for udp (default)
 //	  1 for tcp (default)
+//	congestionControl:
+//	  TCP congestion control algorithm name, e.g. "bbr", "cubic"
+//	  ignored when protocol is not tcp
 //
 //export startWg
-func startWg(logLevel, protocol C.int, interfaceName *C.cchar_t) C.int {
+func startWg(logLevel, protocol C.int, interfaceName, congestionControl *C.cchar_t) C.int {
 	name := C.GoString(interfaceName)
 	logger = device.NewLogger(
 		int(logLevel),
@@ -120,7 +123,11 @@ func startWg(logLevel, protocol C.int, interfaceName *C.cchar_t) C.int {
 	case 0:
 		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
 	case 1:
-		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
+		tcpBind := conn.NewTCPBind().(*conn.TcpBind)
+		if cc := C.GoString(congestionControl); cc != "" {
+			tcpBind.SetCongestionControl(cc)
+		}
+		wgDevice = device.NewDevice(tunDevice, tcpBind, logger)
 	default:
 		logger.Errorf("Protocol %d not supported", protocol)
 		return ExitSetupFailed
@@ -167,16 +174,17 @@ func parseAddrList(s string) ([]netip.Addr, error) {
 // SOCKS5 proxy. Outbound connections accepted by the proxy are dialed through
 // the tunnel via tnet.DialContext.
 //
-//	protocol:    0 for udp (default), 1 for tcp
-//	addresses:   comma-separated interface IPs/CIDRs assigned by the server
-//	dnsServers:  comma-separated DNS server IPs (resolved inside the tunnel)
-//	socksListen: listen address for the SOCKS5 proxy, e.g. "0.0.0.0:1080"
-//	socksUser:   SOCKS5 username; empty disables authentication
-//	socksPass:   SOCKS5 password (used only when socksUser is non-empty)
-//	mtu:         interface MTU (<=0 uses the default)
+//	protocol:          0 for udp (default), 1 for tcp
+//	addresses:         comma-separated interface IPs/CIDRs assigned by the server
+//	dnsServers:        comma-separated DNS server IPs (resolved inside the tunnel)
+//	socksListen:       listen address for the SOCKS5 proxy, e.g. "0.0.0.0:1080"
+//	socksUser:         SOCKS5 username; empty disables authentication
+//	socksPass:         SOCKS5 password (used only when socksUser is non-empty)
+//	mtu:               interface MTU (<=0 uses the default)
+//	congestionControl: TCP congestion control algorithm name, ignored for udp
 //
 //export startWgNetstack
-func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListen, socksUser, socksPass *C.cchar_t, mtu C.int) C.int {
+func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListen, socksUser, socksPass, congestionControl *C.cchar_t, mtu C.int) C.int {
 	logger = device.NewLogger(int(logLevel), "wg-corplink(netstack) ")
 	logger.Verbosef("Starting wg-corplink version %s (netstack/socks5 mode)", Version)
 
@@ -200,7 +208,7 @@ func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListe
 		m = device.DefaultMTU
 	}
 
-	tunDevice, netStack, err := netstack.CreateNetTUN(addrs, dns, m)
+	tunDevice, netStack, err := netstack.CreateNetTUNWithCC(addrs, dns, m, C.GoString(congestionControl))
 	if err != nil {
 		logger.Errorf("Failed to create netstack TUN device: %v", err)
 		return ExitSetupFailed
@@ -211,7 +219,11 @@ func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListe
 	case 0:
 		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
 	case 1:
-		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
+		tcpBind := conn.NewTCPBind().(*conn.TcpBind)
+		if cc := C.GoString(congestionControl); cc != "" {
+			tcpBind.SetCongestionControl(cc)
+		}
+		wgDevice = device.NewDevice(tunDevice, tcpBind, logger)
 	default:
 		logger.Errorf("Protocol %d not supported", protocol)
 		return ExitSetupFailed
