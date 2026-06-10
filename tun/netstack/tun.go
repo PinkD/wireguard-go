@@ -53,6 +53,10 @@ type netTun struct {
 type Net netTun
 
 func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error) {
+	return CreateNetTUNWithCC(localAddresses, dnsServers, mtu, "")
+}
+
+func CreateNetTUNWithCC(localAddresses, dnsServers []netip.Addr, mtu int, cc string) (tun.Device, *Net, error) {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
@@ -70,6 +74,13 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device,
 	tcpipErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
 	if tcpipErr != nil {
 		return nil, nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
+	}
+	if cc != "" {
+		ccOpt := tcpip.CongestionControlOption(cc)
+		tcpipErr = dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
+		if tcpipErr != nil {
+			return nil, nil, fmt.Errorf("could not set TCP congestion control to %q: %v", cc, tcpipErr)
+		}
 	}
 	dev.notifyHandle = dev.ep.AddNotify(dev)
 	tcpipErr = dev.stack.CreateNIC(1, dev.ep)

@@ -1,11 +1,13 @@
 package conn
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/netip"
 	"runtime"
 	"sync"
+	"syscall"
 
 	"golang.zx2c4.com/wireguard/common"
 )
@@ -35,9 +37,14 @@ type TcpBind struct {
 	tcpConnMap common.SyncMap[string, *net.TCPConn]
 	listener   *net.TCPListener
 
-	dataPool  sync.Pool
-	recvChan  chan *recvData
-	closeChan chan struct{}
+	dataPool   sync.Pool
+	recvChan   chan *recvData
+	closeChan  chan struct{}
+	congestion string
+}
+
+func (t *TcpBind) SetCongestionControl(cc string) {
+	t.congestion = cc
 }
 
 type reqLen [4]byte
@@ -133,13 +140,22 @@ func (t *TcpBind) Open(port uint16) (fns []ReceiveFunc, actualPort uint16, err e
 	t.recvChan = make(chan *recvData)
 	t.closeChan = make(chan struct{})
 
-	t.listener, err = net.ListenTCP("tcp", &net.TCPAddr{Port: int(port)})
+	lc := net.ListenConfig{}
+	if t.congestion != "" {
+		lc.Control = func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				_ = setTCPCongestionControl(int(fd), t.congestion)
+			})
+		}
+	}
+	l, err := lc.Listen(context.Background(), "tcp", (&net.TCPAddr{Port: int(port)}).String())
 	if err != nil {
 		return nil, 0, err
 	}
+	t.listener = l.(*net.TCPListener)
 	go t.accept()
 	fn := t.makeReceive()
-	return []ReceiveFunc{fn}, port, nil
+	return []ReceiveFunc{fn}, uint16(t.listener.Addr().(*net.TCPAddr).Port), nil
 }
 
 func (t *TcpBind) Close() error {
@@ -179,10 +195,20 @@ func (t *TcpBind) getConn(endpoint Endpoint) (*net.TCPConn, error) {
 		IP:   ip,
 		Port: int(endpoint.(*StdNetEndpoint).Port()),
 	}
-	conn, err := net.DialTCP("tcp", nil, addr)
+
+	d := net.Dialer{}
+	if t.congestion != "" {
+		d.Control = func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				_ = setTCPCongestionControl(int(fd), t.congestion)
+			})
+		}
+	}
+	c, err := d.DialContext(context.Background(), "tcp", addr.String())
 	if err != nil {
 		return nil, err
 	}
+	conn = c.(*net.TCPConn)
 	t.handleConn(conn, endpoint)
 	t.tcpConnMap.Store(endpoint.DstToString(), conn)
 	return conn, nil
