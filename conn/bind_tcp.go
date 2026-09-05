@@ -86,7 +86,19 @@ func (t *TcpBind) makeReceive() ReceiveFunc {
 
 func (t *TcpBind) handleConn(conn *net.TCPConn, endpoint Endpoint) {
 	go func() {
-		defer conn.Close()
+		// When the reader goroutine exits (peer closed the connection or a read
+		// error occurred) the connection must be evicted from tcpConnMap. Otherwise
+		// the next Send() reuses this already-closed connection and keeps failing with
+		// "use of closed network connection" forever, never redialing/reconnecting.
+		// Only evict if it is still the same connection, to avoid removing a fresh one
+		// that a concurrent reconnect may have stored under the same key.
+		defer func() {
+			key := endpoint.DstToString()
+			if cur, ok := t.tcpConnMap.Load(key); ok && cur == conn {
+				t.tcpConnMap.Delete(key)
+			}
+			conn.Close()
+		}()
 		for {
 			data := t.dataPool.Get().(*recvData)
 			// read uint32 size header
@@ -201,12 +213,23 @@ func (t *TcpBind) Send(bufs [][]byte, endpoint Endpoint) error {
 		var l reqLen
 		l.FromLen(len(buf))
 		b := net.Buffers{l[:], buf}
-		_, err := b.WriteTo(conn)
-		if err != nil {
+		if _, err := b.WriteTo(conn); err != nil {
+			t.dropConn(endpoint, conn)
 			return err
 		}
 	}
 	return nil
+}
+
+// dropConn closes a failed connection and removes it from the cache so that the
+// next Send() redials and establishes a fresh connection. Only the exact
+// connection is removed, to avoid evicting one created by a concurrent reconnect.
+func (t *TcpBind) dropConn(endpoint Endpoint, conn *net.TCPConn) {
+	key := endpoint.DstToString()
+	if cur, ok := t.tcpConnMap.Load(key); ok && cur == conn {
+		t.tcpConnMap.Delete(key)
+	}
+	_ = conn.Close()
 }
 
 func (t *TcpBind) ParseEndpoint(s string) (Endpoint, error) {
