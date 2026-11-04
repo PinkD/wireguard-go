@@ -368,10 +368,12 @@ func (device *Device) RemoveAllPeers() {
 }
 
 func (device *Device) Close() {
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
+	// Match changeState/upLocked: state must precede ipcMutex, otherwise an
+	// asynchronous TUN EventUp can deadlock with shutdown.
 	device.state.Lock()
 	defer device.state.Unlock()
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
 	if device.isClosed() {
 		return
 	}
