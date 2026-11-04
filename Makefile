@@ -9,7 +9,7 @@ MAKEFLAGS += --no-print-directory
 
 generate-version-and-build:
 	@export GIT_CEILING_DIRECTORIES="$(realpath $(CURDIR)/..)" && \
-	tag="$$(git describe --dirty 2>/dev/null)" && \
+	tag="$$(git describe --always --dirty 2>/dev/null)" && \
 	ver="$$(printf 'package main\n\nconst Version = "%s"\n' "$$tag")" && \
 	[ "$$(cat version.go 2>/dev/null)" != "$$ver" ] && \
 	echo "$$ver" > version.go && \
@@ -18,7 +18,7 @@ generate-version-and-build:
 
 generate-version:
 	@export GIT_CEILING_DIRECTORIES="$(realpath $(CURDIR)/..)" && \
-	tag="$$(git describe --dirty 2>/dev/null)" && \
+	tag="$$(git describe --always --dirty 2>/dev/null)" && \
 	ver="$$(printf 'package main\n\nconst Version = "%s"\n' "$$tag")" && \
 	[ "$$(cat version.go 2>/dev/null)" != "$$ver" ] && \
 	echo "$$ver" > version.go && \

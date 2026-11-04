@@ -210,7 +210,14 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 
 	defer func() {
 		if err != nil {
-			device.log.Errorf("%v", err)
+			// Parser errors can include caller-supplied lines and values.
+			// Never echo configuration (including keys) into persistent logs.
+			var status *IPCError
+			code := int64(ipc.IpcErrorUnknown)
+			if errors.As(err, &status) {
+				code = status.ErrorCode()
+			}
+			device.log.Errorf("UAPI set failed (errno=%d)", code)
 		}
 	}()
 
@@ -509,7 +516,7 @@ func (device *Device) IpcHandle(socket net.Conn) {
 			}
 			err = device.IpcGetOperation(buffered.Writer)
 		default:
-			device.log.Errorf("invalid UAPI operation: %v", op)
+			device.log.Errorf("invalid UAPI operation")
 			return
 		}
 
@@ -520,7 +527,7 @@ func (device *Device) IpcHandle(socket net.Conn) {
 			status = ipcErrorf(ipc.IpcErrorUnknown, "other UAPI error: %w", err)
 		}
 		if status != nil {
-			device.log.Errorf("%v", status)
+			device.log.Errorf("UAPI operation failed (errno=%d)", status.ErrorCode())
 			fmt.Fprintf(buffered, "errno=%d\n\n", status.ErrorCode())
 		} else {
 			fmt.Fprintf(buffered, "errno=0\n\n")

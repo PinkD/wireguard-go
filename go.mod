@@ -3,7 +3,7 @@ module golang.zx2c4.com/wireguard
 go 1.23.1
 
 require (
-	github.com/things-go/go-socks5 v0.1.1
+	github.com/things-go/go-socks5 v0.1.4
 	golang.org/x/crypto v0.37.0
 	golang.org/x/net v0.39.0
 	golang.org/x/sys v0.32.0

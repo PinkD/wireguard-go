@@ -1,208 +1,337 @@
 package conn
 
 import (
+	"context"
+	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
 	"runtime"
 	"sync"
-
-	"golang.zx2c4.com/wireguard/common"
+	"time"
 )
 
-var (
-	_ Bind = (*TcpBind)(nil)
-)
+var _ Bind = (*TcpBind)(nil)
 
-// MaxSegmentSize ref: device.MaxSegmentSize, we choose the max
+// MaxSegmentSize matches the largest packet accepted by the device.
 const MaxSegmentSize = 65535
 
-func NewTCPBind() Bind {
+const (
+	tcpMaxConnections = 128
+	tcpDialTimeout    = 10 * time.Second
+	tcpFrameTimeout   = 10 * time.Second
+	tcpIdleTimeout    = 2 * time.Minute
+)
+
+var errInvalidTCPFrame = errors.New("invalid TCP frame length")
+
+// NewTCPBind permits incoming connections for applications acting as a server.
+func NewTCPBind() Bind { return newTCPBind(false) }
+
+// NewTCPClientBind only dials configured peer endpoints. Replies use the same
+// full-duplex TCP connection; no inbound listening socket is needed by clients.
+func NewTCPClientBind() Bind { return newTCPBind(true) }
+
+func newTCPBind(clientOnly bool) *TcpBind {
 	return &TcpBind{
-		dataPool: sync.Pool{
-			New: func() any {
-				data := &recvData{
-					buff: make([]byte, MaxSegmentSize),
-				}
-				return data
-			},
-		},
+		clientOnly: clientOnly,
+		dataPool: sync.Pool{New: func() any {
+			return &recvData{buff: make([]byte, MaxSegmentSize)}
+		}},
 	}
 }
 
 type TcpBind struct {
-	// TODO: do we need mutex?
-	tcpConnMap common.SyncMap[string, *net.TCPConn]
-	listener   *net.TCPListener
+	mu         sync.Mutex
+	state      *tcpBindState
+	mark       uint32
+	clientOnly bool
+	dataPool   sync.Pool
+}
 
-	dataPool  sync.Pool
-	recvChan  chan *recvData
-	closeChan chan struct{}
+// Every Open owns independent state. An old ReceiveFunc must stay closed even
+// when the bind is reopened, and an old reader must never reach the new channel.
+type tcpBindState struct {
+	mu       sync.Mutex
+	dialMu   sync.Mutex
+	conns    map[string]*tcpConnection
+	listener *net.TCPListener
+	ctx      context.Context
+	cancel   context.CancelFunc
+	recv     chan *recvData
+	wg       sync.WaitGroup
+	mark     uint32
+}
+
+type tcpConnection struct {
+	conn     *net.TCPConn
+	endpoint *StdNetEndpoint
+	writeMu  sync.Mutex // the header and body form one indivisible write
 }
 
 type reqLen [4]byte
 
-func (l *reqLen) Len() int {
-	return int(l[0]) + int(l[1])<<8 + int(l[2])<<16 + int(l[3])<<24
-}
-
-func (l *reqLen) FromLen(len int) {
-	l[0] = byte(len & 0xff)
-	l[1] = byte(len >> 8 & 0xff)
-	l[2] = byte(len >> 16 & 0xff)
-	l[3] = byte(len >> 24 & 0xff)
-}
+func (l *reqLen) Len() uint32   { return binary.LittleEndian.Uint32(l[:]) }
+func (l *reqLen) FromLen(n int) { binary.LittleEndian.PutUint32(l[:], uint32(n)) }
 
 type recvData struct {
-	len      [4]byte
 	buff     []byte
 	size     int
 	endpoint Endpoint
 }
 
-func (t *TcpBind) makeReceive() ReceiveFunc {
-	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
+func (t *TcpBind) makeReceive(s *tcpBindState) ReceiveFunc {
+	return func(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
+		select {
+		case <-s.ctx.Done():
+			return 0, net.ErrClosed
+		default:
+		}
 		if len(bufs) == 0 {
 			return 0, nil
 		}
-
-		count := 0
 		select {
-		case <-t.closeChan:
+		case <-s.ctx.Done():
 			return 0, net.ErrClosed
-		case data := <-t.recvChan:
-			if data == nil {
-				return 0, nil
+		case data := <-s.recv:
+			defer t.dataPool.Put(data)
+			if s.ctx.Err() != nil {
+				return 0, net.ErrClosed
 			}
-			sizes[count] = data.size
-			copy(bufs[count], data.buff[:sizes[count]])
-			eps[count] = data.endpoint
-			count++
-			return count, nil
+			if len(bufs[0]) < data.size || len(sizes) == 0 || len(eps) == 0 {
+				return 0, io.ErrShortBuffer
+			}
+			sizes[0] = copy(bufs[0], data.buff[:data.size])
+			eps[0] = data.endpoint
+			return 1, nil
 		}
 	}
 }
 
-func (t *TcpBind) handleConn(conn *net.TCPConn, endpoint Endpoint) {
-	go func() {
-		data := t.dataPool.Get().(*recvData)
-		defer t.dataPool.Put(data)
-		defer conn.Close()
-		for {
-			// read uint32 size header
-			_, err := io.ReadFull(conn, data.len[:])
-			if err != nil {
-				return
-			}
-			l := reqLen(data.len)
-			size := l.Len()
-			// read real data
-			n, err := io.ReadFull(conn, data.buff[:size])
-			if err != nil {
-				return
-			}
-			if n != size {
-				continue
-			}
-			data.size = size
-			data.endpoint = endpoint
-			select {
-			case <-t.closeChan:
-				return
-			default:
-			}
-			t.recvChan <- data
-		}
-	}()
+// readTCPFrame checks the unsigned wire length before converting it to int or
+// slicing. The partial-header and body deadline bounds slow/incomplete frames.
+func readTCPFrame(conn net.Conn, buff []byte, idleTimeout, frameTimeout time.Duration) (int, error) {
+	var header reqLen
+	if err := conn.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
+		return 0, err
+	}
+	if _, err := io.ReadFull(conn, header[:1]); err != nil {
+		return 0, err
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(frameTimeout)); err != nil {
+		return 0, err
+	}
+	if _, err := io.ReadFull(conn, header[1:]); err != nil {
+		return 0, err
+	}
+	size := header.Len()
+	if size == 0 || size > MaxSegmentSize || uint64(size) > uint64(len(buff)) {
+		return 0, errInvalidTCPFrame
+	}
+	return io.ReadFull(conn, buff[:int(size)])
 }
 
-func (t *TcpBind) accept() {
+func (s *tcpBindState) remove(c *tcpConnection) {
+	s.mu.Lock()
+	if s.conns[c.endpoint.DstToString()] == c {
+		delete(s.conns, c.endpoint.DstToString())
+	}
+	s.mu.Unlock()
+	c.conn.Close()
+}
+
+// register is called with s.mu held, so Close cannot race a WaitGroup.Add.
+func (t *TcpBind) register(s *tcpBindState, c *tcpConnection) error {
+	if s.ctx.Err() != nil {
+		return net.ErrClosed
+	}
+	key := c.endpoint.DstToString()
+	old := s.conns[key]
+	if old == nil && len(s.conns) >= tcpMaxConnections {
+		return errors.New("TCP connection limit reached")
+	}
+	if s.mark != 0 {
+		if err := setTCPMark(c.conn, s.mark); err != nil {
+			return err
+		}
+	}
+	if old != nil {
+		// An incoming connection may race a pending outbound dial for the
+		// same endpoint. Do not leave the displaced reader outside the map.
+		old.conn.Close()
+	}
+	s.conns[key] = c
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer s.remove(c)
+		for {
+			data := t.dataPool.Get().(*recvData)
+			n, err := readTCPFrame(c.conn, data.buff, tcpIdleTimeout, tcpFrameTimeout)
+			if err != nil {
+				t.dataPool.Put(data)
+				return
+			}
+			data.size, data.endpoint = n, c.endpoint
+			select {
+			case <-s.ctx.Done():
+				t.dataPool.Put(data)
+				return
+			case s.recv <- data:
+				// The receiver owns this buffer until it has copied the payload.
+			}
+		}
+	}()
+	return nil
+}
+
+func (t *TcpBind) accept(s *tcpBindState) {
+	defer s.wg.Done()
 	for {
-		conn, err := t.listener.AcceptTCP()
+		conn, err := s.listener.AcceptTCP()
 		if err != nil {
 			return
 		}
-		addrPort := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
-		endpoint := &StdNetEndpoint{AddrPort: addrPort}
-		t.tcpConnMap.Store(endpoint.DstToString(), conn)
-		t.handleConn(conn, endpoint)
+		endpoint := &StdNetEndpoint{AddrPort: conn.RemoteAddr().(*net.TCPAddr).AddrPort()}
+		s.mu.Lock()
+		err = t.register(s, &tcpConnection{conn: conn, endpoint: endpoint})
+		s.mu.Unlock()
+		if err != nil {
+			conn.Close()
+		}
 	}
 }
 
-func (t *TcpBind) Open(port uint16) (fns []ReceiveFunc, actualPort uint16, err error) {
-	t.recvChan = make(chan *recvData)
-	t.closeChan = make(chan struct{})
-
-	t.listener, err = net.ListenTCP("tcp", &net.TCPAddr{Port: int(port)})
-	if err != nil {
-		return nil, 0, err
+func (t *TcpBind) Open(port uint16) ([]ReceiveFunc, uint16, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.state != nil {
+		return nil, 0, ErrBindAlreadyOpen
 	}
-	go t.accept()
-	fn := t.makeReceive()
-	return []ReceiveFunc{fn}, port, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &tcpBindState{ctx: ctx, cancel: cancel, recv: make(chan *recvData), conns: make(map[string]*tcpConnection), mark: t.mark}
+	actualPort := uint16(0)
+	if !t.clientOnly {
+		var err error
+		s.listener, err = net.ListenTCP("tcp", &net.TCPAddr{Port: int(port)})
+		if err != nil {
+			cancel()
+			return nil, 0, err
+		}
+		actualPort = uint16(s.listener.Addr().(*net.TCPAddr).Port)
+		s.wg.Add(1)
+		go t.accept(s)
+	}
+	t.state = s
+	return []ReceiveFunc{t.makeReceive(s)}, actualPort, nil
 }
 
 func (t *TcpBind) Close() error {
-	var err error
-	t.tcpConnMap.Range(func(endpoint string, v *net.TCPConn) bool {
-		e := v.Close()
-		if e != nil {
-			err = e
-		}
-		return true
-	})
-	if t.listener != nil {
-		_ = t.listener.Close()
+	t.mu.Lock()
+	s := t.state
+	if s == nil {
+		t.mu.Unlock()
+		return nil
 	}
-	if t.closeChan != nil {
-		close(t.closeChan)
+	s.mu.Lock()
+	s.cancel() // interrupts pending dial, receive, and channel delivery
+	if s.listener != nil {
+		s.listener.Close()
 	}
-	return err
+	for _, c := range s.conns {
+		c.conn.Close()
+	}
+	s.mu.Unlock()
+	t.state = nil
+	t.mu.Unlock()
+	s.wg.Wait()
+	return nil
 }
 
-func (t *TcpBind) getConn(endpoint Endpoint) (*net.TCPConn, error) {
-	conn, ok := t.tcpConnMap.Load(endpoint.DstToString())
-	if ok {
-		return conn, nil
+func (t *TcpBind) getConn(endpoint Endpoint) (*tcpBindState, *tcpConnection, error) {
+	ep, ok := endpoint.(*StdNetEndpoint)
+	if !ok || ep == nil || !ep.AddrPort.IsValid() || ep.Port() == 0 {
+		return nil, nil, ErrWrongEndpointType
 	}
-
-	ip := make(net.IP, net.IPv6len)
-	if endpoint.DstIP().Is6() {
-		as16 := endpoint.DstIP().As16()
-		copy(ip, as16[:])
-	} else {
-		as4 := endpoint.DstIP().As4()
-		copy(ip, as4[:])
-		ip = ip[:4]
+	t.mu.Lock()
+	s := t.state
+	t.mu.Unlock()
+	if s == nil {
+		return nil, nil, net.ErrClosed
 	}
-	addr := &net.TCPAddr{
-		IP:   ip,
-		Port: int(endpoint.(*StdNetEndpoint).Port()),
+	// Serialize connection creation to avoid duplicate sockets and leaked readers.
+	s.dialMu.Lock()
+	defer s.dialMu.Unlock()
+	s.mu.Lock()
+	if c := s.conns[ep.DstToString()]; c != nil {
+		s.mu.Unlock()
+		return s, c, nil
 	}
-	conn, err := net.DialTCP("tcp", nil, addr)
+	if s.ctx.Err() != nil {
+		s.mu.Unlock()
+		return nil, nil, net.ErrClosed
+	}
+	if len(s.conns) >= tcpMaxConnections {
+		s.mu.Unlock()
+		return nil, nil, errors.New("TCP connection limit reached")
+	}
+	s.mu.Unlock()
+	dialer := net.Dialer{Timeout: tcpDialTimeout}
+	conn, err := dialer.DialContext(s.ctx, "tcp", ep.DstToString())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	t.handleConn(conn, endpoint)
-	t.tcpConnMap.Store(endpoint.DstToString(), conn)
-	return conn, nil
+	c := &tcpConnection{conn: conn.(*net.TCPConn), endpoint: &StdNetEndpoint{AddrPort: ep.AddrPort}}
+	s.mu.Lock()
+	err = t.register(s, c)
+	s.mu.Unlock()
+	if err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	return s, c, nil
 }
 
 func (t *TcpBind) Send(bufs [][]byte, endpoint Endpoint) error {
-	conn, err := t.getConn(endpoint)
+	for _, buf := range bufs {
+		if len(buf) == 0 || len(buf) > MaxSegmentSize {
+			return errInvalidTCPFrame
+		}
+	}
+	s, c, err := t.getConn(endpoint)
 	if err != nil {
 		return err
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	for _, buf := range bufs {
-		var l reqLen
-		l.FromLen(len(buf))
-		_, err := conn.Write(l[:])
+		var header reqLen
+		header.FromLen(len(buf))
+		if err = c.conn.SetWriteDeadline(time.Now().Add(tcpFrameTimeout)); err == nil {
+			buffers := net.Buffers{header[:], buf}
+			_, err = buffers.WriteTo(c.conn)
+		}
 		if err != nil {
+			s.remove(c)
 			return err
 		}
-		_, err = conn.Write(buf)
-		if err != nil {
-			return err
+	}
+	return nil
+}
+
+func (t *TcpBind) SetMark(mark uint32) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mark = mark
+	if s := t.state; s != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.mark = mark
+		for _, c := range s.conns {
+			if err := setTCPMark(c.conn, mark); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -213,9 +342,7 @@ func (t *TcpBind) ParseEndpoint(s string) (Endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &StdNetEndpoint{
-		AddrPort: e,
-	}, nil
+	return &StdNetEndpoint{AddrPort: e}, nil
 }
 
 func (t *TcpBind) BatchSize() int {
