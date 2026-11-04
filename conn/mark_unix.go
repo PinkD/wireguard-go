@@ -65,25 +65,20 @@ func (s *StdNetBind) SetMark(mark uint32) error {
 	return nil
 }
 
-func (t *TcpBind) SetMark(mark uint32) error {
+func setTCPMark(conn *net.TCPConn, mark uint32) error {
 	if fwmarkIoctl == 0 {
 		return nil
 	}
-	var err error
-	t.tcpConnMap.Range(func(_ string, v *net.TCPConn) bool {
-		fd, e := v.SyscallConn()
-		if e != nil {
-			err = e
-			return false
-		}
-		e = fd.Control(func(fd uintptr) {
-			err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, fwmarkIoctl, int(mark))
-		})
-		if e == nil {
-			err = e
-			return false
-		}
-		return true
+	fd, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var sockErr error
+	err = fd.Control(func(fd uintptr) {
+		sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, fwmarkIoctl, int(mark))
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return sockErr
 }

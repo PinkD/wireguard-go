@@ -38,6 +38,8 @@ var wgDevice *device.Device
 // It is nil when running in the normal kernel-TUN mode.
 var tnet *netstack.Net
 
+var socksProxy *socksService
+
 //export uapi
 func uapi(cmdStr *C.cchar_t) *C.char {
 	content := C.GoString(cmdStr)
@@ -81,10 +83,14 @@ var logger *device.Logger
 
 //export stopWg
 func stopWg() {
+	socksProxy.Close()
+	socksProxy = nil
 	if wgDevice != nil {
 		wgDevice.Close()
+		wgDevice = nil
 		logger.Verbosef("Shutting down")
 	}
+	tnet = nil
 }
 
 // startWg param:
@@ -120,8 +126,9 @@ func startWg(logLevel, protocol C.int, interfaceName *C.cchar_t) C.int {
 	case 0:
 		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
 	case 1:
-		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
+		wgDevice = device.NewDevice(tunDevice, conn.NewTCPClientBind(), logger)
 	default:
+		tunDevice.Close()
 		logger.Errorf("Protocol %d not supported", protocol)
 		return ExitSetupFailed
 	}
@@ -211,13 +218,15 @@ func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListe
 	case 0:
 		wgDevice = device.NewDevice(tunDevice, conn.NewDefaultBind(), logger)
 	case 1:
-		wgDevice = device.NewDevice(tunDevice, conn.NewTCPBind(), logger)
+		wgDevice = device.NewDevice(tunDevice, conn.NewTCPClientBind(), logger)
 	default:
+		tunDevice.Close()
 		logger.Errorf("Protocol %d not supported", protocol)
 		return ExitSetupFailed
 	}
 
 	if err := wgDevice.Up(); err != nil {
+		wgDevice.Close()
 		logger.Errorf("Failed to bring up netstack device: %v", err)
 		return ExitSetupFailed
 	}
@@ -225,10 +234,13 @@ func startWgNetstack(logLevel, protocol C.int, addresses, dnsServers, socksListe
 	listen := C.GoString(socksListen)
 	user := C.GoString(socksUser)
 	pass := C.GoString(socksPass)
-	if err := startSocks5(listen, user, pass, netStack, logger); err != nil {
+	proxy, err := startSocks5(listen, user, pass, netStack, logger)
+	if err != nil {
+		wgDevice.Close()
 		logger.Errorf("Failed to start socks5 proxy on %s: %v", listen, err)
 		return ExitSetupFailed
 	}
+	socksProxy = proxy
 	logger.Verbosef("socks5 proxy listening on %s", listen)
 	return ExitSetupSuccess
 }

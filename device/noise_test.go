@@ -38,8 +38,13 @@ func randDevice(t *testing.T) *Device {
 		t.Fatal(err)
 	}
 	tun := tuntest.NewChannelTUN()
+	// Handshake messages and AEAD payloads are exchanged directly below. Keep
+	// this crypto-only device down by consuming the fixture's initial EventUp
+	// before NewDevice starts its event reader. Interface startup and platform
+	// socket lifecycles are unrelated to the handshake assertions in this test.
+	<-tun.TUN().Events()
 	logger := NewLogger(LogLevelError, "")
-	device := NewDevice(tun.TUN(), conn.NewDefaultBind(), logger)
+	device := NewDevice(tun.TUN(), conn.NewStdNetBind(), logger)
 	device.SetPrivateKey(sk)
 	return device
 }
