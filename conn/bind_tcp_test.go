@@ -3,8 +3,10 @@ package conn
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -290,5 +292,99 @@ func TestTCPReplacingEndpointClosesDisplacedReader(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("Close waits for an untracked reader")
+	}
+}
+
+func TestTCPBindSendReceive(t *testing.T) {
+	listener := NewTCPBind().(*TcpBind)
+	fns, port, err := listener.Open(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	// Open returns the selected listening port without exposing bind state.
+
+	client := NewTCPBind().(*TcpBind)
+	_, _, err = client.Open(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ep, err := client.ParseEndpoint(fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packets := []string{
+		"hello world",
+		"packet 2",
+		strings.Repeat("X", 4096),
+		strings.Repeat("Y", MaxSegmentSize),
+	}
+
+	bufs := make([][]byte, 1)
+	sizes := make([]int, 1)
+	eps := make([]Endpoint, 1)
+
+	for i, want := range packets {
+		err := client.Send([][]byte{[]byte(want)}, ep)
+		if err != nil {
+			t.Fatalf("send packet %d: %v", i, err)
+		}
+
+		bufs[0] = make([]byte, MaxSegmentSize)
+		n, err := fns[0](bufs, sizes, eps)
+		if err != nil {
+			t.Fatalf("recv packet %d: %v", i, err)
+		}
+		if n != 1 {
+			t.Fatalf("expected 1 packet, got %d", n)
+		}
+		if sizes[0] != len(want) {
+			t.Fatalf("packet %d size mismatch: got %d, want %d", i, sizes[0], len(want))
+		}
+		got := string(bufs[0][:sizes[0]])
+		if got != want {
+			t.Fatalf("packet %d content mismatch:\ngot  %q\nwant %q", i, got, want)
+		}
+	}
+}
+
+func TestTCPBindReceiveOversized(t *testing.T) {
+	listener := NewTCPBind().(*TcpBind)
+	_, port, err := listener.Open(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	// Directly dial and send a malformed length header
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	var l reqLen
+	l.FromLen(MaxSegmentSize + 1)
+	_, err = conn.Write(l[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for closure with a deadline, without a timing-dependent sleep.
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	_, err = conn.Read(buf)
+	if err == nil {
+		t.Fatal("expected connection to be closed after oversized packet")
+	}
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		t.Fatal("oversized packet did not close connection before deadline")
 	}
 }
